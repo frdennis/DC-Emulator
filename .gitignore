@@ -14,5 +14,3 @@ __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
 
-# Model weights are distributed separately (see README)
-*.pt
