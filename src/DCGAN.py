@@ -13,7 +13,7 @@ from .utils import *
 
 
 class DCGAN():
-    def __init__(self, state_path="/mn/stornext/d8/data/dennisfr/DCstyleGAN/cscs/state_142.pt",
+    def __init__(self, state_path="src/state_142.pt",
             device="cpu"):
         #device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device = device
@@ -41,7 +41,7 @@ class DCGAN():
             - n (list)                          :   specific noise realization
 
         Returns:
-            - y (numpy array [1, 3, 2N, 2N, 2N])    :   predicted upscaled displacement field
+            - y (numpy array [3, 2N, 2N, 2N])    :   predicted upscaled displacement field
         """
         # Convert redshift to scale factor if given
         if z is not None and a is None:
@@ -159,17 +159,6 @@ class DCGAN():
             output_p = self.upscale(input_p, style_p, n=self.noise_arr)
             output_m = self.upscale(input_m, style_m, n=self.noise_arr)
 
-            """
-            dis(input_p, a=style_p[0])
-            dis(input_m, a=style_m[0])
-
-            output_p = torch.from_numpy(chunk_upscale(input_p, style_p, self.model, noise_arr=self.noise_arr))
-            output_m = torch.from_numpy(chunk_upscale(input_m, style_m, self.model, noise_arr=self.noise_arr))
-            
-            dis(output_p, undo=True, a=style_p[0])
-            dis(output_m, undo=True, a=style_m[0])
-            """
-
             dx = output_p - output_m
             velocity = dx / dt * a / h
 
@@ -220,7 +209,7 @@ class DCGAN():
         return pos, vel, ids, header
 
     def order(self, arr, ids):
-        _arr = np.zeros((arr.shape[0]*8, 3)) * np.nan
+        _arr = np.zeros((arr.shape[0]*8, 3)) * np.nan   # *8 since IC IDs are sourced from HR ICs with 8x more particles
         _arr[ids] = arr
         _arr = _arr[~np.isnan(_arr).any(axis=1)] # pop elements with NaN values
         return _arr
@@ -305,6 +294,3 @@ class DCGAN():
             lambda x: 1/(x*self.H(x, Om_k, Om_m, Om_l, h)), 
             a1, a2
         )[0]
-    
-if __name__ == "__main__":
-    vel = DCvel()

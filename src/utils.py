@@ -1,7 +1,5 @@
 import torch
 import numpy as np
-import MAS_library as MASL
-import Pk_library as PKL
 
 
 def narrow_like_(a, b):
@@ -78,7 +76,7 @@ def dis2pos(dis_field,boxsize,Ng):
     return pos
 
 def mass_assignment(input, Ngrid, BoxSize=1000., MAS='PCS', verbose=True):
-    input = dis2pos(np.array(input), 1000., Ngrid).reshape((3, Ngrid*Ngrid*Ngrid))
+    input = dis2pos(np.array(input), BoxSize, Ngrid).reshape((3, Ngrid*Ngrid*Ngrid))
 
     input = np.moveaxis(input, -1, 0)
 
