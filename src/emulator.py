@@ -12,7 +12,7 @@ from .utils import chunk_upscale, dis
 
 STYLE_PARAMS = ("a", "Om_k", "sigma8", "Om_m", "h")
 
-DEFAULT_WEIGHTS = Path(__file__).resolve().parent.parent / "dc_emulator_weights.pt"
+DEFAULT_WEIGHTS = Path(__file__).resolve().parent / "dc_emulator_weights.pt"
 
 # Parameter ranges covered by the training simulations (Fremstad et al. 2026, Sect. 3.2)
 TRAINING_RANGES = {
@@ -50,7 +50,8 @@ class DCEmulator:
     ----------
     state_path : str, optional
         Path to the trained weights (a ``.pt`` file containing a ``'model'`` state
-        dict). Defaults to ``dc_emulator_weights.pt`` in the repository root.
+        dict). Defaults to the weights shipped with the package,
+        ``src/dc_emulator_weights.pt``.
     device : str or torch.device, optional
         Where to run the network, e.g. ``"cpu"`` or ``"cuda"``. Defaults to
         ``"cuda"`` if available, otherwise ``"cpu"``.
@@ -78,9 +79,10 @@ class DCEmulator:
         state_path = Path(state_path)
         if not state_path.is_file():
             raise FileNotFoundError(
-                f"Model weights not found at '{state_path}'. Download "
-                f"'{DEFAULT_WEIGHTS.name}' as described in the README and place it in "
-                f"the repository root, or pass its location with state_path=..."
+                f"Model weights not found at '{state_path}'. The default weights are "
+                f"in src/{DEFAULT_WEIGHTS.name}; if that file is missing, clone the "
+                f"repository again (or check out that file), or pass the location of "
+                f"your weights with state_path=..."
             )
         state = torch.load(state_path, map_location="cpu", weights_only=True)
         self.model = UNetG(in_chan=3, out_chan=3, style_size=len(STYLE_PARAMS))

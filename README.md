@@ -23,10 +23,9 @@ pip install -r requirements.txt
 
 ### Model weights
 
-The trained weights (~50 MB) are not stored in the repository. Download
-`dc_emulator_weights.pt` from <!-- TODO: link to GitHub Release / Zenodo -->
-and place it in the repository root. To keep them somewhere else, pass
-`DCEmulator(state_path=...)`.
+The trained weights (~50 MB) are included in the repository as
+`src/dc_emulator_weights.pt` and are loaded automatically by `DCEmulator()`.
+To use a different set of weights, pass `DCEmulator(state_path=...)`.
 
 ## Usage
 
@@ -118,7 +117,8 @@ src/
 ├── model.py      # UNetG generator network
 ├── layers.py     # Styled convolutions, noise injection, U-Net blocks
 ├── utils.py      # Chunked inference, normalisation, cosmology helpers
-└── analysis.py   # Mass assignment and power spectra (requires Pylians)
+├── analysis.py   # Mass assignment and power spectra (requires Pylians)
+└── dc_emulator_weights.pt   # Trained generator weights
 example.ipynb     # Tutorial
 ```
 
