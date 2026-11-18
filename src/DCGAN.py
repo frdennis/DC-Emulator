@@ -1,296 +1,292 @@
-import torch
 import numpy as np
-import readgadget
-from tqdm import tqdm
+import torch
 import scipy.integrate as integrate
+import readgadget
 
-import os
-import shutil 
-import subprocess
-
-from .model import AUNetG
-from .utils import *
+from .model import UNetG, make_noise
+from .utils import chunk_upscale, dis
 
 
-class DCGAN():
-    def __init__(self, state_path="src/state_142.pt",
-            device="cpu"):
-        #device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.device = device
-        state = torch.load(state_path, map_location=torch.device('cpu'))
+STYLE_PARAMS = ("a", "Om_k", "sigma8", "Om_m", "h")
 
-        self.model = AUNetG(in_chan=3, out_chan=3, style_size=5, scale_factor=2).to(device)
-        self.model.load_state_dict(state['model'])
-        self.model.eval()
 
-        self.noise_arr = []
-        noise_sdims = [142, 142, 140, 72, 72, 70, 37, 37, 
-                        37, 37, 37, 72, 72, 72, 72, 142, 142, 142]
-        for n in noise_sdims:
-            self.noise_arr.append(torch.randn(1,1,n,n,n))
+class DCGAN:
+    """Super-resolution emulator for N-body displacement and velocity fields.
 
-    
-    def upscale(self, x, s=None, n=None,
-            a=None, z=None,
-            Om_k=None, sigma8=None, Om_m=None, h=None):
-        """Upscale input field x for a given style s with optional noise array n
+    Takes a low-resolution (LR) simulation snapshot and predicts the
+    displacement field of a simulation with 2x the resolution per dimension
+    (8x the particles), conditioned on cosmology.
 
-        Parameters:
-            - x (numpy array [3, N, N, N])   :   input displacement field
-            - s (numpy array [5])            :   style parameters
-            - n (list)                          :   specific noise realization
+    Parameters
+    ----------
+    state_path : str
+        Path to the trained weights (a ``.pt`` file containing a ``'model'`` state dict).
+    device : str or torch.device, optional
+        Where to run the network, e.g. ``"cpu"`` or ``"cuda"``. Defaults to
+        ``"cuda"`` if available, otherwise ``"cpu"``.
+    seed : int, optional
+        Seed for the fixed noise realisation used by ``noise="fixed"`` and by
+        ``velocity``. If None, a random seed is used.
+    nsplit : int
+        The box is processed in ``nsplit**3`` chunks to limit memory use.
+    pad : int
+        Number of periodic padding cells on each side of a chunk.
+    verbose : bool
+        Print progress while upscaling.
+    """
 
-        Returns:
-            - y (numpy array [3, 2N, 2N, 2N])    :   predicted upscaled displacement field
+    def __init__(self, state_path, device=None, seed=None, nsplit=4, pad=3, verbose=True):
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(device)
+        self.seed = seed
+        self.nsplit = nsplit
+        self.pad = pad
+        self.verbose = verbose
+
+        state = torch.load(state_path, map_location="cpu")
+        self.model = UNetG(in_chan=3, out_chan=3, style_size=len(STYLE_PARAMS))
+        self.model.load_state_dict(state["model"])
+        self.model.to(self.device).eval()
+
+        self._fixed_noise = {}   # chunk size -> fixed noise realisation
+
+    # ------------------------------------------------------------------
+    # Core
+    # ------------------------------------------------------------------
+
+    def fixed_noise(self, Ngrid):
+        """Return the fixed noise realisation for an input box of ``Ngrid**3`` cells."""
+        chunk_size = Ngrid // self.nsplit + 2 * self.pad
+        if chunk_size not in self._fixed_noise:
+            self._fixed_noise[chunk_size] = make_noise(chunk_size, seed=self.seed)
+        return self._fixed_noise[chunk_size]
+
+    def upscale(self, x, s=None, noise=None, *,
+                a=None, z=None, Om_k=None, sigma8=None, Om_m=None, h=None):
+        """Upscale a low-resolution displacement field by 2x per dimension.
+
+        The cosmology is given either as a style vector ``s`` or with keyword
+        arguments (``z`` may be given instead of ``a``).
+
+        Parameters
+        ----------
+        x : np.ndarray, shape [3, N, N, N]
+            Low-resolution displacement field in Mpc/h. Not modified.
+        s : array-like, shape [5], optional
+            Style vector ``[a, Om_k, sigma8, Om_m, h]``.
+        noise : None, "fixed" or list, optional
+            None draws new random noise (a new realisation every call).
+            ``"fixed"`` uses the model's fixed realisation (see ``seed``), so
+            repeated calls are deterministic. A list from ``model.make_noise``
+            uses that realisation.
+
+        Returns
+        -------
+        np.ndarray, shape [3, 2N, 2N, 2N]
+            Predicted high-resolution displacement field in Mpc/h.
         """
-        # Convert redshift to scale factor if given
         if z is not None and a is None:
             a = 1.0 / (1.0 + z)
 
-        # Handle style
-        if s is not None:
-            s = np.asarray(s)
+        if s is None:
+            values = dict(a=a, Om_k=Om_k, sigma8=sigma8, Om_m=Om_m, h=h)
+            missing = [k for k, v in values.items() if v is None]
+            if missing:
+                raise ValueError(f"Missing parameter(s): {', '.join(missing)}")
+            s = [values[k] for k in STYLE_PARAMS]
 
-            if s.size != 5:
-                raise ValueError(
-                    "Style input s must contain exactly 5 parameters: "
-                    "[a, Om_k, sigma8, Om_m, h]"
-                )
+        s = torch.as_tensor(np.asarray(s, dtype=np.float32).ravel())
+        if s.numel() != len(STYLE_PARAMS):
+            raise ValueError(f"Style vector must contain exactly {len(STYLE_PARAMS)} "
+                             f"parameters: {list(STYLE_PARAMS)}")
 
-            s = torch.tensor(
-                s, dtype=torch.float32,
-                device=self.device
-            )#.reshape(1,5)
-        else:
-            required = {
-                "a": a,
-                "Om_k": Om_k, 
-                "sigma8": sigma8,
-                "Om_m": Om_m,
-                "h": h, 
-            }
+        if isinstance(noise, str):
+            if noise != "fixed":
+                raise ValueError(f"Unknown noise option {noise!r}")
+            noise = self.fixed_noise(x.shape[1])
 
-            missing = [key for key, value in required.items() if value is None]
+        x = np.array(x, dtype=np.float32)   # copy, so the caller's array is not modified
+        a = float(s[0])
 
-            if len(missing) > 0:
-                raise ValueError(
-                    f"Missing parameter(s): {', '.join(missing)}. "
-                )
+        dis(x, a=a)
+        y = chunk_upscale(x, s, self.model, nsplit=self.nsplit, pad=self.pad,
+                          noise_arr=noise, verbose=self.verbose)
+        dis(y, a=a, undo=True)
 
-            s = torch.tensor(
-                [a, Om_k, sigma8, Om_m, h],
-                dtype=torch.float32,
-                device=self.device
-            )
+        return y
 
-        #if s is not None and len(style) == 5:
-        #    s = torch.from_numpy(s).to(self.device).to(torch.float32)   
-        #style = torch.tensor([a, Om_k, sigma8, Om_m, h], dtype=torch.float32)
+    # ------------------------------------------------------------------
+    # Snapshot interface
+    # ------------------------------------------------------------------
 
-        x = torch.from_numpy(x).to(self.device).to(torch.float32)
-        #s = torch.from_numpy(s).to(self.device).to(torch.float32)
+    def position(self, snapshot, snapshot_ic, sigma8, upscale=True, noise=None):
+        """Displacement field of a Gadget snapshot, optionally super-resolved.
 
-        if n == True:           
-            n = self.noise_arr  # Use noise array from init
-        elif n == None:
-            n = [None,]*18      # Tell each Addnoise to generate on the fly
+        Parameters
+        ----------
+        snapshot : str
+            Path to the low-resolution Gadget snapshot (CDM particles, type 1).
+        snapshot_ic : str
+            Unperturbed initial conditions (particles on the Lagrangian lattice),
+            used to obtain the Lagrangian positions q.
+        sigma8 : float
+            sigma_8 of the simulation (not stored in the Gadget header).
+        upscale : bool
+            If False, return the low-resolution field from the snapshot.
+        noise : None, "fixed" or list
+            See ``upscale``.
 
-        dis(x, a=s[0])
-        y = torch.from_numpy(chunk_upscale(x, s, self.model, noise_arr=n))
-        dis(y, a=s[0], undo=True)
+        Returns
+        -------
+        np.ndarray, shape [3, N, N, N] (or [3, 2N, 2N, 2N] if ``upscale``)
+            Displacement field psi = x - q in Mpc/h, ordered on the Lagrangian lattice.
+        """
+        style = self._style_from_header(snapshot, sigma8)
+        dis_lr = self.make_lag_dz(snapshot, snapshot_ic, dz=0.0)
 
-        return np.array(y)
-
-
-    def velocity(self, snapshot, snapshot_ic, 
-        sigma8,
-        dz=None, da=None, upscale=True
-        ):
-        header = readgadget.header(snapshot)
-        
-        a       = header.time
-        z       = header.redshift
-        Om_m    = header.omega_m
-        Om_l    = header.omega_l
-        h       = header.hubble
-
-        Om_k    = 1. - (Om_m + Om_l)
-
-        if da is not None:  # Mainly use this one
-            zm = 1 / (a + da) - 1
-            zp = 1 / (a - da) - 1
-
-            dzp = zp - z
-            dzm = zm - z
-            dap = da 
-            dam = -da
-        elif dz is not None:
-            ap = 1 / (1 + z + dz)
-            am = 1 / (1 + z - dz)
-
-            dzp = dz
-            dzm = -dz
-            dap = ap - a 
-            dam = am - a
-        else:
-            raise ValueError("Either dz or da must be provided") 
-
-        style = torch.tensor([a, Om_k, sigma8, Om_m, h], dtype=torch.float32)
-
-        style_p = style.clone()
-        style_p[0] = a + dap    # t+dt
-        input_p = self.make_lag_dz(snapshot, snapshot_ic, dzp)
-
-        style_m = style.clone() 
-        style_m[0] = a + dam    # t-dt
-        input_m = self.make_lag_dz(snapshot, snapshot_ic, dzm)
-
-        #dt = self.t(Om_k, Om_m, Om_l, h, a + dap, a + dam) 
-        dt = self.t(Om_k, Om_m, Om_l, h, a + dam, a + dap) 
         if not upscale:
-            dx = input_p - input_m
-            #return input_p, input_m
+            return dis_lr
+        return self.upscale(dis_lr, style, noise=noise)
 
-            velocity = dx / dt * a / h
-        else:
-            #input_p = torch.from_numpy(input_p).to(torch.float32)
-            #input_m = torch.from_numpy(input_m).to(torch.float32)
+    def velocity(self, snapshot, snapshot_ic, sigma8, dz=None, da=None, upscale=True):
+        """Velocity field v = (a/h) dx/dt from a central finite difference in time.
 
-            output_p = self.upscale(input_p, style_p, n=self.noise_arr)
-            output_m = self.upscale(input_m, style_m, n=self.noise_arr)
+        The particles are drifted to t +/- dt using their snapshot velocities,
+        each state is upscaled, and the difference gives the velocity. The same
+        fixed noise realisation is used for both states, so the difference
+        reflects the change in the field rather than a change in noise.
 
-            dx = output_p - output_m
-            velocity = dx / dt * a / h
+        Parameters
+        ----------
+        snapshot, snapshot_ic, sigma8 :
+            As in ``position``.
+        dz, da : float
+            Half-width of the time step in redshift or in scale factor.
+            Exactly one must be given.
+        upscale : bool
+            If False, return the low-resolution velocity field.
 
-        return velocity
-
-    def position(self, snapshot, snapshot_ic, 
-            sigma8, upscale=True, noise=None):
-        
+        Returns
+        -------
+        np.ndarray, shape [3, N, N, N] (or [3, 2N, 2N, 2N] if ``upscale``)
+        """
         header = readgadget.header(snapshot)
-        a       = header.time
-        z       = header.redshift
-        Om_m    = header.omega_m
-        Om_l    = header.omega_l
-        h       = header.hubble
-        
+        a, z = header.time, header.redshift
+        Om_m, Om_l, h = header.omega_m, header.omega_l, header.hubble
         Om_k = 1. - (Om_m + Om_l)
 
-        style = torch.tensor([a, Om_k, sigma8, Om_m, h], dtype=torch.float32)
-        input = self.make_lag_dz(snapshot, snapshot_ic, dz=0.0)
+        # "p" is the later time (larger a), "m" the earlier time
+        if da is not None and dz is None:
+            a_p, a_m = a + da, a - da
+        elif dz is not None and da is None:
+            a_p, a_m = 1 / (1 + z - dz), 1 / (1 + z + dz)
+        else:
+            raise ValueError("Give exactly one of dz or da")
+        dz_p = 1 / a_p - 1 - z
+        dz_m = 1 / a_m - 1 - z
 
-        if not upscale: 
-            return input
-        else: 
-            #input = torch.from_numpy(input).to(torch.float32)
-            output = self.upscale(input, style, n=noise)
+        input_p = self.make_lag_dz(snapshot, snapshot_ic, dz_p)
+        input_m = self.make_lag_dz(snapshot, snapshot_ic, dz_m)
+        dt = self.t(Om_k, Om_m, Om_l, h, a_m, a_p)
 
-            #dis(input, a=style[0])
-            #output = torch.from_numpy(chunk_upscale(input, style, self.model, noise_arr=self.noise_arr))
-            #dis(output, undo=True, a=style[0])
+        if upscale:
+            style = [a, Om_k, sigma8, Om_m, h]
+            style_p = [a_p] + style[1:]
+            style_m = [a_m] + style[1:]
+            input_p = self.upscale(input_p, style_p, noise="fixed")
+            input_m = self.upscale(input_m, style_m, noise="fixed")
 
-            return output
+        return (input_p - input_m) / dt * a / h
+
+    # ------------------------------------------------------------------
+    # Snapshot reading
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _style_from_header(snapshot, sigma8):
+        header = readgadget.header(snapshot)
+        Om_m, Om_l = header.omega_m, header.omega_l
+        return [header.time, 1. - (Om_m + Om_l), sigma8, Om_m, header.hubble]
 
     def readsnap(self, file):
+        """Read CDM positions [Mpc/h], velocities [km/s] and IDs (starting at 0) from a Gadget file."""
         ptype = [1]
 
-        pos = readgadget.read_block(file, "POS ", ptype)/1e3        # positions in Mpc/h
-        vel = readgadget.read_block(file, "VEL ", ptype)            # peculiar velocities in km/s (sqrt(a) * u)
-        ids = readgadget.read_block(file, "ID  ", ptype)  
+        pos = np.array(readgadget.read_block(file, "POS ", ptype)) / 1e3   # kpc/h -> Mpc/h
+        vel = np.array(readgadget.read_block(file, "VEL ", ptype))         # peculiar velocity
+        ids = np.array(readgadget.read_block(file, "ID  ", ptype))
 
-        pos = np.array(pos)
-        vel = np.array(vel)
-        ids = np.array(ids)
-
-        ids -= ids.min()                                            #IDs starting from 0
-
+        ids -= ids.min()
         header = readgadget.header(file)
 
         return pos, vel, ids, header
 
     def order(self, arr, ids):
-        _arr = np.zeros((arr.shape[0]*8, 3)) * np.nan   # *8 since IC IDs are sourced from HR ICs with 8x more particles
+        """Sort particle data by ID, dropping IDs that are not present."""
+        # *8 since the IC IDs are taken from high-resolution ICs with 8x more particles
+        _arr = np.full((arr.shape[0] * 8, 3), np.nan)
         _arr[ids] = arr
-        _arr = _arr[~np.isnan(_arr).any(axis=1)] # pop elements with NaN values
-        return _arr
+        return _arr[~np.isnan(_arr).any(axis=1)]
 
     def make_lag_dz(self, file, file_ic, dz):
+        """Displacement field [3, N, N, N] in Mpc/h, with particles drifted by ``dz`` in redshift.
+
+        ``dz=0`` gives the displacement at the snapshot time. Positive ``dz``
+        drifts the particles backwards in time (to higher redshift).
+        """
         pos, vel, ids, header = self.readsnap(file)
-        pos_ic, vel_ic, ids_ic, header_ic = self.readsnap(file_ic)
+        pos_ic, _, ids_ic, header_ic = self.readsnap(file_ic)
 
         Npart = pos.shape[0]
         Ngrid = int(np.rint(Npart**(1/3)))
-        BoxSize = header.boxsize/1e3
+        BoxSize = header.boxsize / 1e3
 
-        a   = header.time
-        Om0 = header.omega_m #header.Omega0
-        Ol  = header.omega_l #header.omegaLambda
-        #h   = header.hubble
+        a = header.time
+        Om0 = header.omega_m
+        Ol = header.omega_l
         Omk = 1. - Om0 - Ol
 
-        """
-        dx_u = -10.0 * dz * a / np.sqrt(
-            ((Om0 / a) / a) + 
-            (Ol * a) + 
-            #((1. - (Om0 + Ol)) / (a * a * a))  # radiation
-            (Omk / a)                           # curvature
+        # Drift dx = v dt, with dt written in terms of dz. The sqrt(a) is needed
+        # because readgadget multiplies the velocities by sqrt(a) in read_block.
+        dx_u = -10.0 * dz * np.sqrt(a) / np.sqrt(
+            (Om0 / a) / a
+            + Ol * a
+            + Omk / a
         )
-        """
-        dx_u = -10.0 * dz * np.sqrt(a) / np.sqrt(   # need sqrt(a) here since readgadget multiplies a sqrt(a) in read_block
-            ((Om0 / a) / a) + 
-            (Ol * a) + 
-            #((1. - (Om0 + Ol)) / (a * a * a))  # radiation
-            (Omk / a)                           # curvature
-        )
-        
-        assert Npart == header_ic.nall[1]
 
-        pos    = self.order(pos, ids)
-        vel    = self.order(vel, ids)
-        q      = self.order(pos_ic, ids_ic)
+        assert Npart == header_ic.nall[1], "Snapshot and IC files have different particle numbers"
 
-        q = (q + BoxSize) % BoxSize # 
-        indxs = np.rint(q / BoxSize * Ngrid) % Ngrid
-        q = (indxs) / Ngrid * BoxSize
+        pos = self.order(pos, ids)
+        vel = self.order(vel, ids)
+        q = self.order(pos_ic, ids_ic)
 
-        dis = np.ones([Ngrid, Ngrid, Ngrid, 3]) * np.nan
-
-        """
-        for ii, inx in tqdm(enumerate(indxs.astype(int)), total=len(indxs)):
-            i, j, k = inx
-
-            dis[i,j,k] = (pos[ii] + vel[ii] * dx_u/1e3) - q[ii]
-        """
-
-        indxs = indxs.astype(int)
-
-        i = indxs[:, 0]
-        j = indxs[:, 1]
-        k = indxs[:, 2]
+        # Snap the Lagrangian positions to the grid
+        q = (q + BoxSize) % BoxSize
+        indxs = (np.rint(q / BoxSize * Ngrid) % Ngrid).astype(int)
+        q = indxs / Ngrid * BoxSize
 
         disp = (pos + vel * dx_u / 1e3) - q
-        dis[i,j,k] = disp
-        dis -= np.rint(dis / BoxSize) * BoxSize
 
-        assert not np.isnan(dis).any()
+        dis_field = np.full([Ngrid, Ngrid, Ngrid, 3], np.nan)
+        dis_field[indxs[:, 0], indxs[:, 1], indxs[:, 2]] = disp
+        dis_field -= np.rint(dis_field / BoxSize) * BoxSize   # periodic wrap
 
-        dis = np.moveaxis(dis, -1, 0)
-        return dis
+        assert not np.isnan(dis_field).any(), "Some grid cells received no particle"
 
+        return np.moveaxis(dis_field, -1, 0)
 
-    def H(self, a, Om_k=0.013, Om_m=0.307, Om_l=0.7, h=0.73):
+    # ------------------------------------------------------------------
+    # Cosmology
+    # ------------------------------------------------------------------
 
-        #Om_r = 1 - (Om_l + Om_k + Om_m)
-        Om_r = 0.0
-        return 100*h * np.sqrt(Om_r*a**(-4) + Om_m*a**(-3) + Om_k*a**(-2) + Om_l) # km/s/Mpc
+    @staticmethod
+    def H(a, Om_k, Om_m, Om_l, h):
+        """Hubble parameter in km/s/Mpc (radiation neglected)."""
+        return 100 * h * np.sqrt(Om_m * a**-3 + Om_k * a**-2 + Om_l)
 
     def t(self, Om_k, Om_m, Om_l, h, a1, a2):
-        #a       = style[0]
-        #Om_k    = style[1]
-        #Om_m    = style[3]
-        #h       = style[4] #* 3.241e-20 # km/s/Mpc
-
+        """Time between scale factors a1 and a2, int da / (a H)."""
         return integrate.quad(
-            lambda x: 1/(x*self.H(x, Om_k, Om_m, Om_l, h)), 
-            a1, a2
+            lambda x: 1 / (x * self.H(x, Om_k, Om_m, Om_l, h)), a1, a2
         )[0]

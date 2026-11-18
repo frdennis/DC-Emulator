@@ -1,0 +1,5 @@
+torch>=2.0
+numpy
+scipy
+Pylians        # readgadget (snapshot I/O), MAS_library and Pk_library (src/analysis.py)
+matplotlib     # example notebook only

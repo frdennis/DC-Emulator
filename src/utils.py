@@ -1,11 +1,16 @@
-import torch
 import numpy as np
+import torch
+from scipy.special import hyp2f1
 
+
+# ---------------------------------------------------------------------------
+# Cropping helpers
+# ---------------------------------------------------------------------------
 
 def narrow_like_(a, b):
-    """Narrow a to be like b.
+    """Narrow torch tensor ``a`` to the spatial shape of ``b``.
 
-    Try to be symmetric but cut more on the right for odd difference
+    Try to be symmetric but cut more on the right for odd difference.
     """
     for d in range(2, a.dim()):
         width = a.shape[d] - b.shape[d]
@@ -13,56 +18,96 @@ def narrow_like_(a, b):
         a = a.narrow(d, half_width, a.shape[d] - width)
     return a
 
-def narrow_by(a, c):
-    """Narrow a by size c symmetrically on all edges.
+
+def narrow_like(field, tgt_grid):
+    """Crop a numpy field of shape [C, N, N, N] symmetrically to [C, tgt_grid, tgt_grid, tgt_grid]."""
+    width = np.shape(field)[1] - tgt_grid
+    begin = width // 2
+    stop = begin + tgt_grid
+    return field[:, begin:stop, begin:stop, begin:stop]
+
+
+def cropfield(field, idx, reps, crop, pad):
+    """Extract chunk number ``idx`` of a periodic field [C, N, N, N], padded by ``pad`` cells."""
+    start = np.unravel_index(idx, reps) * crop
+    x = field
+    for d, (i, N, (p0, p1)) in enumerate(zip(start, crop, pad)):
+        x = x.take(range(i - p0, i + N + p1), axis=1 + d, mode='wrap')
+    return x
+
+
+# ---------------------------------------------------------------------------
+# Inference
+# ---------------------------------------------------------------------------
+
+def chunk_upscale(input, style, model, nsplit=4, pad=3, scale_factor=2,
+                  noise_arr=None, verbose=True):
+    """Super-resolve a full periodic box by running the model chunk by chunk.
+
+    The box is split into ``nsplit**3`` cubes, each padded periodically by
+    ``pad`` cells, upscaled, and cropped back before being stitched together.
+
+    Parameters
+    ----------
+    input : torch.Tensor or np.ndarray, shape [3, N, N, N]
+        Normalised low-resolution displacement field.
+    style : torch.Tensor, shape [5]
+        Style vector ``[a, Om_k, sigma8, Om_m, h]``.
+    model : torch.nn.Module
+        The generator; inference runs on the device its parameters live on.
+    noise_arr : list or None
+        Fixed noise passed to the model (see ``model.make_noise``); None draws
+        new noise for each chunk.
+
+    Returns
+    -------
+    np.ndarray, shape [3, scale_factor*N, scale_factor*N, scale_factor*N], float32
     """
-    ind = (slice(None),) * 2 + (slice(c, -c),) * (a.dim() - 2)
-    return a[ind]
+    device = next(model.parameters()).device
 
-
-def chunk_upscale(input, style, model, device='cpu', nsplit=4, pad=3, scale_factor=2, verbose=True, noise_arr=[None,]*18):
-    size = input.shape[1:]
-    size = np.asarray(size)
+    field = np.asarray(input.cpu() if torch.is_tensor(input) else input)
+    size = np.asarray(field.shape[1:])
     ndim = len(size)
 
-    chunk_size = size // nsplit
-    crop = np.broadcast_to(chunk_size, size.shape)
+    if np.any(size % nsplit):
+        raise ValueError(f"Grid size {tuple(size)} is not divisible by nsplit={nsplit}")
 
+    crop = size // nsplit
     reps = size // crop
     tot_reps = int(np.prod(reps))
-
     pad = np.broadcast_to(pad, (ndim, 2))
 
-    tgt_size = crop[0]*scale_factor
-    tgt_chunk = np.broadcast_to(tgt_size, size.shape)
+    tgt_size = crop[0] * scale_factor
+    Ngrid_SR = size[0] * scale_factor
+    output = np.zeros([field.shape[0], Ngrid_SR, Ngrid_SR, Ngrid_SR], dtype=np.float32)
 
-    Ngrid_SR = size[0]*scale_factor
-    SR_displacement = np.zeros([3, Ngrid_SR, Ngrid_SR, Ngrid_SR], dtype=np.float32)
+    style = style.to(device).unsqueeze(0)
+
+    with torch.no_grad():
+        for idx in range(tot_reps):
+            chunk = torch.from_numpy(cropfield(field, idx, reps, crop, pad)).unsqueeze(0).to(device)
+
+            out = model(chunk, style, noise_arr=noise_arr)[0].cpu().numpy()
+            out = narrow_like(out, tgt_size)
+
+            n0, n1, n2 = np.array(np.unravel_index(idx, reps)) * tgt_size
+            output[:, n0:n0+tgt_size, n1:n1+tgt_size, n2:n2+tgt_size] = out
+
+            if verbose and ((idx + 1) % max(1, tot_reps // 4) == 0 or idx + 1 == tot_reps):
+                print(f"{idx+1}/{tot_reps} chunks done", flush=True)
+
+    return output
 
 
-    style = style.to(device)
+def dis2pos(dis_field, boxsize, Ng):
+    """Convert a displacement field to particle positions.
 
-    for idx in range(0, tot_reps):
-        chunk = torch.tensor(cropfield(np.array(input), idx, reps, crop, pad))
-
-        out = model(chunk.unsqueeze(0).to(device), style.unsqueeze(0), noise_arr=noise_arr).detach().numpy()
-        out = narrow_like(out[0], tgt_size)
-
-        ns = np.unravel_index(idx, reps) * tgt_chunk
-
-        SR_displacement[:,ns[0]:ns[0]+tgt_size,ns[1]:ns[1]+tgt_size,ns[2]:ns[2]+tgt_size] = out
-
-        if (idx+1)%nsplit == 0 and verbose:
-            print("{}/{} done".format(idx+1, tot_reps), flush=True)
-    
-    return SR_displacement
-
-def dis2pos(dis_field,boxsize,Ng):
-    """Assume 'dis_field' is in order of `pid` that aligns with the Lagrangian lattice,
-    and dis_field.shape = (3,Ng,Ng,Ng)
+    Assumes ``dis_field`` has shape [3, Ng, Ng, Ng] and is ordered on the
+    Lagrangian lattice (particle ID order). Positions are wrapped periodically
+    into [0, boxsize).
     """
     cellsize = boxsize / Ng
-    lattice = np.arange(Ng) * cellsize #+ 0.5 * cellsize
+    lattice = np.arange(Ng) * cellsize
 
     pos = dis_field.copy()
 
@@ -70,51 +115,18 @@ def dis2pos(dis_field,boxsize,Ng):
     pos[1] += lattice.reshape(-1, 1)
     pos[0] += lattice.reshape(-1, 1, 1)
 
-    pos[pos<0] += boxsize
-    pos[pos>boxsize] -= boxsize
+    pos[pos < 0] += boxsize
+    pos[pos >= boxsize] -= boxsize
 
     return pos
 
-def mass_assignment(input, Ngrid, BoxSize=1000., MAS='PCS', verbose=True):
-    input = dis2pos(np.array(input), BoxSize, Ngrid).reshape((3, Ngrid*Ngrid*Ngrid))
 
-    input = np.moveaxis(input, -1, 0)
-
-    delta = np.ones((Ngrid, Ngrid, Ngrid), dtype=np.float32)
-    MASL.MA(input, delta, BoxSize, MAS, verbose=verbose)
-    delta /= np.mean(delta) # dtype=np.float64
-
-    return delta
-
-
-
-def power(input, BoxSize=1000., MAS='PCS', threads=16):
-    Pk = PKL.Pk(np.array(input, dtype=np.float32), BoxSize, axis=1, threads=threads, MAS=MAS)
-    k = Pk.k3D
-    Pk = Pk.Pk[:,0]
-    return k, Pk
-
-from scipy.special import hyp2f1
-
-
-def cropfield(field,idx,reps,crop,pad):
-    start = np.unravel_index(idx, reps) * crop
-    x = field.copy()
-    for d, (i, N, (p0, p1)) in enumerate(zip(start, crop, pad)):
-        x = x.take(range(i - p0, i + N + p1), axis=1+d, mode='wrap')
-    return x
-
-
-def narrow_like(SR_box, tgt_grid):
-    width = np.shape(SR_box)[1] - tgt_grid
-    half_width = width // 2 
-    begin, stop = half_width, tgt_grid + half_width
-    return SR_box[:,begin:stop,begin:stop,begin:stop]
-
+# ---------------------------------------------------------------------------
+# Cosmology and normalisation
+# ---------------------------------------------------------------------------
 
 def D(z, Om=0.31):
-    """linear growth function for flat LambdaCDM, normalized to 1 at redshift zero
-    """
+    """Linear growth function for flat LambdaCDM, normalised to 1 at z=0."""
     OL = 1 - Om
     a = 1 / (1 + z)
     return a * hyp2f1(1, 1 / 3, 11 / 6, - OL * a ** 3 / Om) \
@@ -122,8 +134,7 @@ def D(z, Om=0.31):
 
 
 def f(z, Om=0.31):
-    """linear growth rate for flat LambdaCDM
-    """
+    """Linear growth rate for flat LambdaCDM."""
     OL = 1 - Om
     a = 1 / (1 + z)
     aa3 = OL * a ** 3 / Om
@@ -132,16 +143,21 @@ def f(z, Om=0.31):
 
 
 def H(z, Om=0.31):
-    """Hubble in [h km/s/Mpc] for flat LambdaCDM
-    """
+    """Hubble parameter in [h km/s/Mpc] for flat LambdaCDM."""
     OL = 1 - Om
     a = 1 / (1 + z)
     return 100 * np.sqrt(Om / a ** 3 + OL)
 
 
 def dis(x, undo=False, a=0.3333, dis_std=6.0, **kwargs):
+    """Normalise a displacement field in place (or undo the normalisation).
+
+    The field is divided by ``dis_std * D(z)``. ``Om=0.31`` in ``D`` is fixed
+    on purpose: this is the normalisation the network was trained with, and it
+    is independent of the cosmology passed in the style vector.
+    """
     z = 1 / a - 1
-    dis_norm = dis_std * D(z)  # [Kpc/h]
+    dis_norm = dis_std * D(z)
 
     if not undo:
         dis_norm = 1 / dis_norm

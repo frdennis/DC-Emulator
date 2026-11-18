@@ -1,2 +1,18 @@
+# This folder also holds analysis notebooks and data that are not part of the
+# repository, so ignore everything at the top level and list what to track.
+/*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/CITATION.cff
+!/requirements.txt
+!/example.ipynb
+!/src/
+
+# Python / Jupyter
 __pycache__/
 *.py[cod]
+.ipynb_checkpoints/
+
+# Model weights are distributed separately (see README)
+*.pt
