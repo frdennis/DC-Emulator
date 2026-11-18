@@ -1,3 +1,6 @@
+import warnings
+from pathlib import Path
+
 import numpy as np
 import torch
 import scipy.integrate as integrate
@@ -9,8 +12,34 @@ from .utils import chunk_upscale, dis
 
 STYLE_PARAMS = ("a", "Om_k", "sigma8", "Om_m", "h")
 
+DEFAULT_WEIGHTS = Path(__file__).resolve().parent.parent / "dc_emulator_weights.pt"
 
-class DCGAN:
+# Parameter ranges covered by the training simulations (Fremstad et al. 2026, Sect. 3.2)
+TRAINING_RANGES = {
+    "a": (0.25, 0.75),
+    "Om_k": (-0.1, 0.1),
+    "sigma8": (0.76969, 0.85071),
+    "Om_m": (0.29555, 0.32666),
+    "h": (0.674, 0.768),
+}
+# Mean particle spacing of the low-resolution training simulations [Mpc/h]
+TRAINING_SPACING = 1000. / 256
+
+
+def check_inputs(style, spacing=None):
+    """Warn if the style vector or particle spacing lies outside the training data."""
+    for name, value in zip(STYLE_PARAMS, np.asarray(style, dtype=float).ravel()):
+        lo, hi = TRAINING_RANGES[name]
+        if not lo <= value <= hi:
+            warnings.warn(f"{name} = {value:.4g} is outside the training range "
+                          f"[{lo}, {hi}]; results are an extrapolation.", stacklevel=3)
+    if spacing is not None and not np.isclose(spacing, TRAINING_SPACING, rtol=0.01):
+        warnings.warn(f"Mean particle spacing {spacing:.3g} Mpc/h differs from the "
+                      f"training data ({TRAINING_SPACING:.3g} Mpc/h); the model is "
+                      f"unlikely to work well.", stacklevel=3)
+
+
+class DCEmulator:
     """Super-resolution emulator for N-body displacement and velocity fields.
 
     Takes a low-resolution (LR) simulation snapshot and predicts the
@@ -19,8 +48,9 @@ class DCGAN:
 
     Parameters
     ----------
-    state_path : str
-        Path to the trained weights (a ``.pt`` file containing a ``'model'`` state dict).
+    state_path : str, optional
+        Path to the trained weights (a ``.pt`` file containing a ``'model'`` state
+        dict). Defaults to ``dc_emulator_weights.pt`` in the repository root.
     device : str or torch.device, optional
         Where to run the network, e.g. ``"cpu"`` or ``"cuda"``. Defaults to
         ``"cuda"`` if available, otherwise ``"cpu"``.
@@ -35,7 +65,8 @@ class DCGAN:
         Print progress while upscaling.
     """
 
-    def __init__(self, state_path, device=None, seed=None, nsplit=4, pad=3, verbose=True):
+    def __init__(self, state_path=DEFAULT_WEIGHTS, device=None, seed=None, nsplit=4, pad=3,
+                 verbose=True):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
@@ -44,7 +75,14 @@ class DCGAN:
         self.pad = pad
         self.verbose = verbose
 
-        state = torch.load(state_path, map_location="cpu")
+        state_path = Path(state_path)
+        if not state_path.is_file():
+            raise FileNotFoundError(
+                f"Model weights not found at '{state_path}'. Download "
+                f"'{DEFAULT_WEIGHTS.name}' as described in the README and place it in "
+                f"the repository root, or pass its location with state_path=..."
+            )
+        state = torch.load(state_path, map_location="cpu", weights_only=True)
         self.model = UNetG(in_chan=3, out_chan=3, style_size=len(STYLE_PARAMS))
         self.model.load_state_dict(state["model"])
         self.model.to(self.device).eval()
@@ -63,7 +101,8 @@ class DCGAN:
         return self._fixed_noise[chunk_size]
 
     def upscale(self, x, s=None, noise=None, *,
-                a=None, z=None, Om_k=None, sigma8=None, Om_m=None, h=None):
+                a=None, z=None, Om_k=None, sigma8=None, Om_m=None, h=None,
+                BoxSize=None):
         """Upscale a low-resolution displacement field by 2x per dimension.
 
         The cosmology is given either as a style vector ``s`` or with keyword
@@ -80,6 +119,9 @@ class DCGAN:
             ``"fixed"`` uses the model's fixed realisation (see ``seed``), so
             repeated calls are deterministic. A list from ``model.make_noise``
             uses that realisation.
+        BoxSize : float, optional
+            Box size in Mpc/h. Only used to warn if the particle spacing
+            differs from the training data.
 
         Returns
         -------
@@ -100,6 +142,7 @@ class DCGAN:
         if s.numel() != len(STYLE_PARAMS):
             raise ValueError(f"Style vector must contain exactly {len(STYLE_PARAMS)} "
                              f"parameters: {list(STYLE_PARAMS)}")
+        check_inputs(s, spacing=None if BoxSize is None else BoxSize / x.shape[1])
 
         if isinstance(noise, str):
             if noise != "fixed":
@@ -147,7 +190,7 @@ class DCGAN:
 
         if not upscale:
             return dis_lr
-        return self.upscale(dis_lr, style, noise=noise)
+        return self.upscale(dis_lr, style, noise=noise, BoxSize=self._boxsize(snapshot))
 
     def velocity(self, snapshot, snapshot_ic, sigma8, dz=None, da=None, upscale=True):
         """Velocity field v = (a/h) dx/dt from a central finite difference in time.
@@ -194,14 +237,20 @@ class DCGAN:
             style = [a, Om_k, sigma8, Om_m, h]
             style_p = [a_p] + style[1:]
             style_m = [a_m] + style[1:]
-            input_p = self.upscale(input_p, style_p, noise="fixed")
-            input_m = self.upscale(input_m, style_m, noise="fixed")
+            BoxSize = header.boxsize / 1e3
+            input_p = self.upscale(input_p, style_p, noise="fixed", BoxSize=BoxSize)
+            input_m = self.upscale(input_m, style_m, noise="fixed", BoxSize=BoxSize)
 
         return (input_p - input_m) / dt * a / h
 
     # ------------------------------------------------------------------
     # Snapshot reading
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _boxsize(snapshot):
+        """Box size in Mpc/h (Gadget headers store kpc/h)."""
+        return readgadget.header(snapshot).boxsize / 1e3
 
     @staticmethod
     def _style_from_header(snapshot, sigma8):
